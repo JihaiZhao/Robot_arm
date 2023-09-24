@@ -5,6 +5,13 @@ import numpy as np
 # Import OpenCV for easy image rendering
 import cv2
 import argparse
+import os
+from filter import erosion, dilatation
+from trackbar import trackbar
+from move_robot import Robot_Model
+import time
+import modern_robotics as mr
+from multiprocessing import Process, Manager
 
 # Create a pipeline
 pipeline = rs.pipeline()
@@ -55,15 +62,15 @@ align_to = rs.stream.color
 align = rs.align(align_to)
 
 #create trackbar
+max_value_H = 180
 max_value = 255
-max_value_H = 360//2
-low_H = 124
+low_H = 50
 low_S = 0
 low_V = 0
-high_H = max_value_H
-high_S = max_value
-high_V = max_value
-window_capture_name = 'Video Capture'
+high_H = 180
+high_S = 255
+high_V = 255
+swindow_capture_name = 'Video Capture'
 window_detection_name = 'Object Detection'
 low_H_name = 'Low H'
 low_S_name = 'Low S'
@@ -71,6 +78,7 @@ low_V_name = 'Low V'
 high_H_name = 'High H'
 high_S_name = 'High S'
 high_V_name = 'High V'
+
 def on_low_H_thresh_trackbar(val):
     global low_H
     global high_H
@@ -116,8 +124,15 @@ cv2.createTrackbar(high_S_name, window_detection_name , high_S, max_value, on_hi
 cv2.createTrackbar(low_V_name, window_detection_name , low_V, max_value, on_low_V_thresh_trackbar)
 cv2.createTrackbar(high_V_name, window_detection_name , high_V, max_value, on_high_V_thresh_trackbar)
 
+robot = Robot_Model()
+
+#find the Tcr, it will not change
+Tcr = robot.camera_robot()
 
 # Streaming loop
+#whith Manager() as manager:
+#d = manger.dirct()
+#p = Process(taget = Robot_Model())
 try:
     while True:
         # Get frameset of color and depth
@@ -129,6 +144,9 @@ try:
 
         # Get aligned frames
         aligned_depth_frame = aligned_frames.get_depth_frame() # aligned_depth_frame is a 640x480 depth image
+        
+        dpt = aligned_depth_frame.as_depth_frame() ###
+        
         color_frame = aligned_frames.get_color_frame()
 
         # Validate that both frames are valid
@@ -150,41 +168,105 @@ try:
         depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
         images = np.hstack((bg_removed, depth_colormap))
 
-
-        #ret, th3 = cv2.adaptiveThreshold(images,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,11,2)
-        #th = [th3]
-
         ## only show purple
-        hsv = cv2.cvtColor(images, cv2.COLOR_BGR2HSV)
-        #lowerBound = np.array([124, 0, 0])
-        #upperBound = np.array([180, 255, 255])
-        lowerBound = np.uint8([[[low_H, low_S, low_V]]])
-        upperBound = np.uint8([[[high_H, high_S, high_V]]])       
-        mask = cv2.inRange(hsv, lowerBound, upperBound)
-        res = cv2.bitwise_and(images, images, mask= mask)
+        hsv = cv2.cvtColor(bg_removed, cv2.COLOR_BGR2HSV) #background
+        hsv = np.array(hsv)
 
-        #cv2.namedWindow('Align Example', cv2.WINDOW_NORMAL)
+        img2gray = cv2.cvtColor(bg_removed,cv2.COLOR_BGR2GRAY)
+
+        lowerBound = np.uint8([[[low_H, low_S, low_V]]])
+        upperBound = np.uint8([[[high_H, high_S, high_V]]])
+
+        purple_mask = cv2.inRange(hsv, lowerBound, upperBound)
+        masked_bg = cv2.bitwise_and(hsv, hsv, mask= purple_mask)
+
+        # clean up masked image
+
+        kernel_1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(12,12))
+        masked_image_opening = cv2.morphologyEx(masked_bg, cv2.MORPH_OPEN, kernel_1)
+        kernel_2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(40,40))
+        masked_image_clean = cv2.morphologyEx(masked_image_opening, cv2.MORPH_CLOSE, kernel_2)
+
+        #contour detection
+        masked_image_gray = cv2.cvtColor(masked_image_clean, cv2.COLOR_BGR2GRAY)
+        ret, thresh = cv2.threshold(masked_image_gray, 10, 255, 0)
+        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        #find the centroid of the object we observed  
+        cx=0
+        cy=0
+        areas = []
+        centroids = []
+        locations = []
+        if len(contours) > 0:
+            for cnt in contours:
+                M = cv2.moments(cnt)
+                #print(M)
+                area = M['m00']
+                try:
+                    cx = int(M['m10']/M['m00'])
+                    cy = int(M['m01']/M['m00'])     
+                    centroid = (cx,cy)
+                    centroids.append(centroid)
+                    areas.append(area)                
+                    rect = cv2.minAreaRect(cnt)
+                    box = cv2.boxPoints(rect)
+                    box = np.int0(box)
+                    cv2.drawContours(masked_image_clean,[box],0,(0,255,0),2) 
+                except:
+                    pass  
+                
+            if areas:
+                max = np.argmax(areas)
+                centroid_max = centroids[max]
+                pixel_distance_in_meters = dpt.get_distance(centroid_max[0], centroid_max[1]) #get the distace of the objhect from the cemra
+
+                p = profile.get_stream(rs.stream.color)
+                intr = p.as_video_stream_profile().get_intrinsics()
+                location = rs.rs2_deproject_pixel_to_point(intr, centroid, pixel_distance_in_meters) 
+                locations.append(location)
+                print(location)
+                cv2.circle(masked_image_clean, centroid_max, 5, [0,0,255], 5)
+
+            #find the location
+            Tcpen = np.array([[1, 0, 0, location[0]],
+                            [0, 1, 0, location[1]],
+                            [0, 0, 1, location[2]],
+                            [0, 0, 0, 1]])
+
+            Trpen = mr.TransInv(np.dot(mr.TransInv(Tcpen), Tcr))
+            
+            #find robot where to go
+            position = mr.TransToRp(Trpen)
+            print(position[1])
+
+            robot.open()
+            time.sleep(2)
+            a = robot.go(position[1][0],position[1][1],position[1][2])
+            
+            if a[1]:
+                robot.close() #close the gripper
+                time.sleep(3)
+                robot.sleep()
+                break           
 
         cv2.namedWindow(window_detection_name, cv2.WINDOW_NORMAL)
-        cv2.imshow('Align Example', images)
-        #cv2.imshow('adaptive', th)
-        cv2.imshow('mask', mask)
-        cv2.imshow(window_detection_name,res)
-        
-        """
-        #draw the contours
-        ret, thresh = cv2.threshold(hsv, 127, 255, 0)
-        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(img, contours, -1, (0,255,0), 3)
-        """
-        
+        #cv2.imshow('Align Example', images)
+        #cv2.imshow('mask', purple_mask)
+        cv2.imshow(window_detection_name, masked_image_clean)      
+
+
+
+        ##open the pipe and write to it
+
         key = cv2.waitKey(1)
         # Press esc or 'q' to close the image window
         if key & 0xFF == ord('q') or key == 27:
             cv2.destroyAllWindows()
             break
-    #
-    #config.enable_record_to_file(recording)
-    #config.enable_device_from_file(recording)
+    #move the robot
+    #p.join()
+
+
 finally:
-    pipeline.stop()
+    pipeline.stop() 
